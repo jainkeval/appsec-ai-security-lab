@@ -115,6 +115,166 @@ For example, if User B tries to access User A's valid order ID, the API should r
 ```
 
 This reduces the risk of object enumeration.
+## Bad Fix: User ID from Request Header
+
+```javascript
+app.get("/api/me/orders/:orderId", async (req, res) => {
+  const authenticatedUserId = req.headers["user-id"];
+  const orderId = req.params.orderId;
+
+  const order = await orderRepository.findByIdAndUserId(
+    orderId,
+    authenticatedUserId
+  );
+
+  if (!order) {
+    return res.status(404).json({ message: "Not found" });
+  }
+
+  return res.json(order);
+});
+```
+
+Why this is still vulnerable:
+
+This looks safer because the query uses both `orderId` and `authenticatedUserId`.
+
+However, the `authenticatedUserId` comes from `req.headers["user-id"]`, which is attacker-controlled input. A malicious user can manually send another user's ID in the request header and attempt to access that user's order.
+
+This is a fake fix because the backend is still trusting identity data supplied by the client.
+
+Secure rule:
+
+The authenticated user ID must come from trusted server-side authentication middleware, not from headers, request body, query parameters, or path parameters.
+
+A safer pattern is:
+
+```javascript
+const authenticatedUserId = req.user.id;
+```
+
+where `req.user` is populated only after the JWT or session has been verified by authentication middleware.
+
+## Trusted Authentication Middleware
+
+A secure IDOR fix depends on having a trusted authenticated user ID.
+
+The backend should not get the user ID from:
+
+```text
+request headers
+request body
+query parameters
+path parameters
+```
+
+These are client-controlled inputs.
+
+Instead, the backend should get the authenticated user ID from verified authentication middleware.
+
+## Bad Pattern: Using jwt.decode()
+
+```javascript
+const payload = jwt.decode(token);
+
+req.user = {
+  id: payload.userId,
+};
+```
+
+This is insecure because `jwt.decode()` only reads the token payload.
+
+It does not verify:
+
+```text
+signature
+expiry
+issuer
+token integrity
+```
+
+An attacker may be able to forge a token payload such as:
+
+```json
+{
+  "userId": 1,
+  "role": "admin"
+}
+```
+
+If the backend trusts `jwt.decode()`, it may treat attacker-controlled data as a real authenticated identity.
+
+## Secure Pattern: Using jwt.verify()
+
+```javascript
+const authMiddleware = (req, res, next) => {
+  const authHeader = req.headers.authorization;
+
+  if (!authHeader || !authHeader.startsWith("Bearer ")) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+
+  const token = authHeader.split(" ")[1];
+
+  try {
+    const payload = jwt.verify(token, JWT_SECRET);
+
+    req.user = {
+      id: payload.userId,
+    };
+
+    next();
+  } catch (err) {
+    return res.status(401).json({ message: "Unauthorized" });
+  }
+};
+```
+
+This is safer because `jwt.verify()` validates the token before the backend trusts the payload.
+
+Only after verification succeeds should the backend attach the user identity to the request:
+
+```javascript
+req.user = {
+  id: payload.userId,
+};
+```
+
+Then downstream route handlers can safely use:
+
+```javascript
+const authenticatedUserId = req.user.id;
+```
+
+## Key Security Rule
+
+For authorization decisions, the authenticated user ID must come from trusted server-side authentication middleware.
+
+It must not come from attacker-controlled inputs such as:
+
+```javascript
+req.headers["user-id"]
+req.body.userId
+req.params.userId
+req.query.userId
+```
+
+A secure object lookup should use:
+
+```text
+orderId from request path + authenticatedUserId from verified middleware
+```
+
+Example:
+
+```javascript
+const order = await orderRepository.findByIdAndUserId(
+  orderId,
+  req.user.id
+);
+```
+
+This protects against fake fixes where the query looks secure but the user identity still comes from the client.
 
 ## Regression Test
 
